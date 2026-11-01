@@ -57,3 +57,4 @@ urllib3==2.7.0
 uvicorn==0.52.4
 websockets==16.1.1
 wheel==0.48.0
+python-docx

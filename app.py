@@ -13,7 +13,10 @@ import sqlite3
 from pypdf import PdfReader
 from dotenv import load_dotenv
 from groq import Groq
+# from google import genai
 from google import genai
+from google.genai import types
+from docx import Document
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 load_dotenv(override=True)
@@ -183,18 +186,68 @@ else:
     )
 # -----------------------------------------------------------
 
-def extract_text_from_pdf(pdf_file) -> str:
+# def extract_text_from_pdf(pdf_file) -> str:
+#     text = ""
+#     try:
+#         reader = PdfReader(pdf_file)
+#         for page in reader.pages:
+#             extracted = page.extract_text()
+#             if extracted:
+#                 text += extracted + "\n"
+#     except Exception as e:
+#         st.error(f"Error reading {pdf_file.name}: {e}")
+#     return text.strip()
+def extract_text_from_pdf(file) -> str:
     text = ""
-    try:
-        reader = PdfReader(pdf_file)
-        for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted + "\n"
-    except Exception as e:
-        st.error(f"Error reading {pdf_file.name}: {e}")
+    reader = PdfReader(io.BytesIO(file.getvalue()))
+    for page in reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            text += extracted + "\n"
     return text.strip()
 
+def extract_text_from_docx(file) -> str:
+    doc = Document(io.BytesIO(file.getvalue()))
+    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    # Many resumes use tables for layout, so read those too
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    parts.append(cell.text.strip())
+    return "\n".join(parts).strip()
+
+def extract_text_from_image(file) -> str:
+    if not GEMINI_API_KEY:
+        raise Exception("GEMINI_API_KEY is required to read image resumes.")
+    ext = file.name.lower().rsplit(".", 1)[-1]
+    mime_types = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=[
+            types.Part.from_bytes(data=file.getvalue(), mime_type=mime_types[ext]),
+            "Extract all the text from this resume/CV image exactly as written. Return only the extracted text."
+        ]
+    )
+    return (response.text or "").strip()
+
+def extract_text_from_file(file) -> str:
+    """Picks the right extractor based on file extension."""
+    name = file.name.lower()
+    try:
+        if name.endswith(".pdf"):
+            return extract_text_from_pdf(file)
+        elif name.endswith(".docx"):
+            return extract_text_from_docx(file)
+        elif name.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            return extract_text_from_image(file)
+        else:
+            st.error(f"Unsupported file type: {file.name}")
+            return ""
+    except Exception as e:
+        st.error(f"Error reading {file.name}: {e}")
+        return ""
 def clean_text(text: str) -> str:
     """Strip non-breaking spaces and other invisible unicode chars that break email headers."""
     if not text:
@@ -423,44 +476,95 @@ def generate_excel_bytes(candidates_data: list) -> bytes:
 st.subheader("1. Target Job Description")
 job_description = st.text_area("Paste job requirements here:", height=150)
 
+# st.subheader("2. Upload Candidate Resumes")
+# uploaded_files = st.file_uploader("Upload candidate PDFs:", type=["pdf"], accept_multiple_files=True)
+# st.subheader("2. Upload Candidate Resumes")
 st.subheader("2. Upload Candidate Resumes")
-uploaded_files = st.file_uploader("Upload candidate PDFs:", type=["pdf"], accept_multiple_files=True)
-
+uploaded_files = st.file_uploader(
+    "Upload candidate resumes (PDF, Word, or image):",
+    type=["pdf", "docx", "png", "jpg", "jpeg", "webp"],
+    accept_multiple_files=True
+)
 if st.button("🚀 Analyze All Resumes", type="primary"):
+    candidates_text = {}
     if not job_description.strip():
         st.warning("Please paste a job description first!")
     elif not uploaded_files:
-        st.warning("Please upload at least one PDF resume!")
+        st.warning("Please upload at least one resume!")
     elif total_weight == 0:
         st.warning("Please set at least one scoring weight above 0 in the sidebar before analyzing.")
     else:
-        candidates_text = {}
-        with st.spinner("Extracting text from uploaded PDFs..."):
-            for pdf in uploaded_files:
-                raw = extract_text_from_pdf(pdf)
+        with st.spinner("Extracting text from uploaded resumes..."):
+            for f in uploaded_files:
+                raw = extract_text_from_file(f)
                 if raw:
-                    candidates_text[pdf.name] = raw
+                    candidates_text[f.name] = raw
+                else:
+                    st.warning(f"Could not extract any text from {f.name}, so it was skipped.")
 
-        if candidates_text:
-            with st.spinner("Evaluating candidates with AI..."):
+    if candidates_text:
+        with st.spinner("Evaluating candidates with AI..."):
+            try:
+                weights = {
+                    "technical": norm_technical,
+                    "experience": norm_experience,
+                    "education": norm_education
+                }
+                result_json = analyze_and_rank_json(candidates_text, job_description, weights)
+                st.session_state.all_summaries = result_json.get("all_candidate_summaries", [])
+                st.session_state.top_candidates = result_json.get("top_candidates", [])
+                save_candidates_to_db(
+                    st.session_state.all_summaries,
+                    st.session_state.top_candidates,
+                    job_description
+                )
+                st.success("✅ Results saved to database for future reference.")
+            except Exception as e:
+                st.error(f"Execution Error: {e}")
+# if st.button("🚀 Analyze All Resumes", type="primary"):
+#     if not job_description.strip():
+#         st.warning("Please paste a job description first!")
+#     elif not uploaded_files:
+#         st.warning("Please upload at least one PDF resume!")
+#     elif total_weight == 0:
+#         st.warning("Please set at least one scoring weight above 0 in the sidebar before analyzing.")
+#     else:
+#                 candidates_text = {}
+#                 with st.spinner("Extracting text from uploaded resumes..."):
+#                   for f in uploaded_files:
+#                     raw = extract_text_from_file(f)
+#                     if raw:
+#                        candidates_text[f.name] = raw
+#                     else:
+#                        st.warning(f"Could not extract any text from {f.name}, so it was skipped.")
+        # candidates_text = {}
+        # with st.spinner("Extracting text from uploaded PDFs..."):
+        #     for pdf in uploaded_files:
+        #         raw = extract_text_from_pdf(pdf)
+        #         if raw:
+        #             candidates_text[pdf.name] = raw
+ 
+
+    # if candidates_text:
+    #         with st.spinner("Evaluating candidates with AI..."):
             
-                try:
-                    weights = {
-                        "technical": norm_technical,
-                        "experience": norm_experience,
-                        "education": norm_education
-                    }
-                    result_json = analyze_and_rank_json(candidates_text, job_description, weights)
-                    st.session_state.all_summaries = result_json.get("all_candidate_summaries", [])
-                    st.session_state.top_candidates = result_json.get("top_candidates", [])
-                    save_candidates_to_db(
-                        st.session_state.all_summaries,
-                        st.session_state.top_candidates,
-                        job_description
-                    )
-                    st.success("✅ Results saved to database for future reference.")
-                except Exception as e:
-                    st.error(f"Execution Error: {e}")
+    #             try:
+    #                 weights = {
+    #                     "technical": norm_technical,
+    #                     "experience": norm_experience,
+    #                     "education": norm_education
+    #                 }
+    #                 result_json = analyze_and_rank_json(candidates_text, job_description, weights)
+    #                 st.session_state.all_summaries = result_json.get("all_candidate_summaries", [])
+    #                 st.session_state.top_candidates = result_json.get("top_candidates", [])
+    #                 save_candidates_to_db(
+    #                     st.session_state.all_summaries,
+    #                     st.session_state.top_candidates,
+    #                     job_description
+    #                 )
+    #                 st.success("✅ Results saved to database for future reference.")
+    #             except Exception as e:
+    #                 st.error(f"Execution Error: {e}")
             
 
  
