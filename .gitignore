@@ -1,0 +1,14 @@
+# Ignore environment secrets
+.env
+
+# Ignore Python virtual environment
+venv/
+.venv/
+env/
+
+# Ignore local database and cache files
+candidates.db
+hr_database.db
+*.db
+__pycache__/
+.DS_Store
